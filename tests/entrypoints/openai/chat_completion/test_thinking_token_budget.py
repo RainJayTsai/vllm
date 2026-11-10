@@ -16,6 +16,7 @@ import pytest_asyncio
 
 import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, multi_gpu_only, requires_fp8
+from vllm.config import ModelConfig, ReasoningConfig
 from vllm.platforms import current_platform
 from vllm.tokenizers import get_tokenizer
 
@@ -81,6 +82,13 @@ def server_with_auto_reasoning_config():
     args = [
         "--reasoning-parser",
         "qwen3",
+        "--reasoning-config",
+        json.dumps(
+            {
+                "enable_implicit_reasoning_end": True,
+                "implicit_reasoning_end_strs": ["<tool_call>"],
+            }
+        ),
         "--max-model-len",
         "2048",
         "--enforce-eager",
@@ -90,6 +98,99 @@ def server_with_auto_reasoning_config():
     ]
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+async def test_implicit_end_budget_preserves_tool_argument_continuation(
+    server_with_auto_reasoning_config, stream, temperature
+):
+    """Budget forcing must not inject </think> inside a continued tool argument.
+
+    Use the raw completions entry point to deterministically resume inside an
+    argument, avoiding dependence on whether this small model chooses a tool.
+    """
+    tokenizer = get_tokenizer(MODEL_NAME)
+    token_ids = tokenizer.encode("a", add_special_tokens=False)
+    assert len(token_ids) == 1
+    prompt = tokenizer.encode(
+        '<think>reasoning<tool_call>{"name":"echo","arguments":{"text":"',
+        add_special_tokens=False,
+    )
+    async with server_with_auto_reasoning_config.get_async_client() as client:
+        result = await client.completions.create(
+            model=MODEL_NAME,
+            prompt=prompt,
+            max_tokens=8,
+            temperature=temperature,
+            seed=42,
+            stream=stream,
+            logit_bias={str(token_ids[0]): 100},
+            extra_body={"thinking_token_budget": 1, "ignore_eos": True},
+        )
+        if stream:
+            text = "".join([chunk.choices[0].text async for chunk in result])
+        else:
+            text = result.choices[0].text
+    assert text == "a" * 8
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_manual_implicit_markers_without_parser_metadata(enabled):
+    """Manual strings work with a real tokenizer even without a parser."""
+    markers = ["<tool_call>", "custom boundary", "<tool_call>"]
+    config = ReasoningConfig(
+        reasoning_start_str="<think>",
+        reasoning_end_str="</think>",
+        enable_implicit_reasoning_end=enabled,
+        implicit_reasoning_end_strs=markers,
+    )
+    config.initialize_token_ids(ModelConfig(model=MODEL_NAME))
+    tokenizer = get_tokenizer(MODEL_NAME)
+    expected = (
+        sorted(
+            {
+                tuple(tokenizer.encode(marker, add_special_tokens=False))
+                for marker in markers
+            }
+        )
+        if enabled
+        else []
+    )
+    assert config.implicit_reasoning_end_token_sequences == [
+        list(seq) for seq in expected
+    ]
+
+
+def test_manual_implicit_markers_merge_with_parser_metadata():
+    tokenizer = get_tokenizer(MODEL_NAME)
+    config = ReasoningConfig(
+        reasoning_parser="qwen3",
+        enable_implicit_reasoning_end=True,
+        implicit_reasoning_end_strs=["custom boundary", "<tool_call>"],
+    )
+    config.initialize_token_ids(ModelConfig(model=MODEL_NAME))
+    assert config.implicit_reasoning_end_token_sequences == [
+        list(seq)
+        for seq in sorted(
+            {
+                tuple(tokenizer.encode("<tool_call>", add_special_tokens=False)),
+                tuple(tokenizer.encode("custom boundary", add_special_tokens=False)),
+            }
+        )
+    ]
+
+
+def test_empty_manual_implicit_marker_is_rejected():
+    config = ReasoningConfig(
+        reasoning_start_str="<think>",
+        reasoning_end_str="</think>",
+        enable_implicit_reasoning_end=True,
+        implicit_reasoning_end_strs=[""],
+    )
+    with pytest.raises(ValueError, match="cannot contain empty strings"):
+        config.initialize_token_ids(ModelConfig(model=MODEL_NAME))
 
 
 @pytest.fixture(scope="module")

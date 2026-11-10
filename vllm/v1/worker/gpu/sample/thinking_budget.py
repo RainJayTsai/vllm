@@ -78,6 +78,15 @@ class ThinkingBudgetState:
         self.reasoning_end_token_ids = torch.tensor(
             end_ids, dtype=torch.int32, device=self.device
         )
+        implicit_sequences = getattr(
+            reasoning_config, "implicit_reasoning_end_token_sequences", []
+        )
+        self.implicit_reasoning_end_lengths = tuple(map(len, implicit_sequences))
+        self.implicit_reasoning_end_token_ids = torch.tensor(
+            [token_id for sequence in implicit_sequences for token_id in sequence],
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
         if not self.enabled:
@@ -130,6 +139,8 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            self.implicit_reasoning_end_token_ids,
+            self.implicit_reasoning_end_lengths,
         )
 
 
@@ -164,8 +175,10 @@ def _update_committed_marker_cache_kernel(
     cached_scan_pos_ptr,
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
+    implicit_reasoning_end_token_ids_ptr,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
+    IMPLICIT_END_LENS: tl.constexpr,
     MAX_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -215,6 +228,26 @@ def _update_committed_marker_cache_kernel(
                 )
                 end_match = end_match & (actual == expected)
 
+            implicit_offset = 0
+            for marker in tl.static_range(len(IMPLICIT_END_LENS)):
+                implicit_len = IMPLICIT_END_LENS[marker]
+                implicit_match = (offs < block_hi) & (offs + implicit_len <= total_len)
+                for j in tl.static_range(IMPLICIT_END_LENS[marker]):
+                    expected = tl.load(
+                        implicit_reasoning_end_token_ids_ptr + implicit_offset + j
+                    )
+                    actual = tl.load(
+                        all_token_ids_ptr
+                        + req_state_idx * all_token_ids_stride
+                        + offs
+                        + j,
+                        mask=offs + j < total_len,
+                        other=-1,
+                    )
+                    implicit_match = implicit_match & (actual == expected)
+                end_match = end_match | implicit_match
+                implicit_offset += implicit_len
+
             last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
             last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
             block_hi = block_lo
@@ -240,7 +273,27 @@ def _update_committed_marker_cache_kernel(
                     )
                     end_match = end_match & (actual == expected)
                 if end_match:
-                    last_end = i
+                    last_end = tl.maximum(last_end, i)
+
+            implicit_offset = 0
+            for marker in tl.static_range(len(IMPLICIT_END_LENS)):
+                implicit_len = IMPLICIT_END_LENS[marker]
+                if i + implicit_len <= total_len:
+                    implicit_match = True
+                    for j in tl.static_range(IMPLICIT_END_LENS[marker]):
+                        expected = tl.load(
+                            implicit_reasoning_end_token_ids_ptr + implicit_offset + j
+                        )
+                        actual = tl.load(
+                            all_token_ids_ptr
+                            + req_state_idx * all_token_ids_stride
+                            + i
+                            + j
+                        )
+                        implicit_match = implicit_match & (actual == expected)
+                    if implicit_match:
+                        last_end = tl.maximum(last_end, i)
+                implicit_offset += implicit_len
 
     tl.store(cached_last_start_ptr + req_state_idx, last_start)
     tl.store(cached_last_end_ptr + req_state_idx, last_end)
@@ -266,9 +319,11 @@ def _thinking_budget_kernel(
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
+    implicit_reasoning_end_token_ids_ptr,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    IMPLICIT_END_LENS: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -322,7 +377,33 @@ def _thinking_budget_kernel(
             )
             end_match = end_match & (actual == expected)
         if end_match:
-            last_end = i
+            last_end = tl.maximum(last_end, i)
+
+    # Draft-prefix boundaries affect only this verification row. Persistent
+    # marker caches are updated exclusively from committed tokens above.
+    implicit_offset = 0
+    for marker in tl.static_range(len(IMPLICIT_END_LENS)):
+        implicit_len = IMPLICIT_END_LENS[marker]
+        implicit_lo = tl.maximum(0, total_len - implicit_len + 1)
+        for i in tl.range(implicit_lo, effective_len - implicit_len + 1):
+            implicit_match = True
+            for j in tl.static_range(IMPLICIT_END_LENS[marker]):
+                expected = tl.load(
+                    implicit_reasoning_end_token_ids_ptr + implicit_offset + j
+                )
+                actual = _load_effective_token(
+                    all_token_ids_ptr,
+                    all_token_ids_stride,
+                    input_ids_ptr,
+                    cur_req_first_pos,
+                    req_state_idx,
+                    total_len,
+                    i + j,
+                )
+                implicit_match = implicit_match & (actual == expected)
+            if implicit_match:
+                last_end = tl.maximum(last_end, i)
+        implicit_offset += implicit_len
 
     if last_start < 0 or last_start <= last_end:
         return
@@ -380,11 +461,21 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    implicit_reasoning_end_token_ids: torch.Tensor | None = None,
+    implicit_reasoning_end_lengths: tuple[int, ...] | None = None,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
     natural_end_len = natural_reasoning_end_token_ids.shape[0]
     end_len = reasoning_end_token_ids.shape[0]
+    if implicit_reasoning_end_lengths is None:
+        implicit_reasoning_end_lengths = (
+            ()
+            if implicit_reasoning_end_token_ids is None
+            else (1,) * implicit_reasoning_end_token_ids.shape[0]
+        )
+    if implicit_reasoning_end_token_ids is None:
+        implicit_reasoning_end_token_ids = natural_reasoning_end_token_ids
 
     _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
         req_ids,
@@ -397,9 +488,11 @@ def apply_thinking_budget(
         cached_scan_pos,
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
+        implicit_reasoning_end_token_ids,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
-        MAX_LEN=max(start_len, natural_end_len),
+        IMPLICIT_END_LENS=implicit_reasoning_end_lengths,
+        MAX_LEN=max(start_len, natural_end_len, *implicit_reasoning_end_lengths),
         BLOCK=_COLD_SCAN_BLOCK,
     )
 
@@ -418,7 +511,9 @@ def apply_thinking_budget(
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
+        implicit_reasoning_end_token_ids,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        IMPLICIT_END_LENS=implicit_reasoning_end_lengths,
     )
