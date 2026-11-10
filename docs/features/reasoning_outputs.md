@@ -304,9 +304,19 @@ If a parser does not supply an implicit marker, configure it explicitly:
 Manual strings are encoded with `add_special_tokens=False`; duplicate sequences
 are removed after merging with parser metadata. Single-token and multi-token
 markers are supported, including sequences crossing decode steps or the
-committed/draft boundary. Only a complete marker ends reasoning; an incomplete
-prefix does not suspend budget enforcement. An empty marker is invalid.
+committed/draft boundary. Only a complete marker ends reasoning. If a marker
+of length `L` started before exhaustion, its matching prefix can defer forcing
+by at most `L - 1` additional tokens. The deadline stays anchored to the original
+budget boundary: repeated prefixes cannot renew it, and a diverged prefix
+immediately loses protection. The extension still counts toward `max_tokens`.
+An empty marker is invalid.
 When the flag is false, both manual markers and parser implicit ends are ignored.
+
+With implicit markers enabled, an end sequence that started at or after budget
+exhaustion takes priority until complete, even if it contains natural or implicit
+end markers. A completed forced sequence stops enforcement; overlapping suffixes
+cannot restart it. This is derived from committed history and each verification
+row's conditional draft prefix, without persisting speculative force progress.
 
 This option changes budget tracking; the serving parser must still understand
 the model's output format. It does not change EOS or thinking re-entry policies,

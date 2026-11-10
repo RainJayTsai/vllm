@@ -500,13 +500,13 @@ def test_v2_multi_token_implicit_end_completed_on_next_decode_step():
     assert cache[1].item() == 1
 
 
-def test_v2_partial_implicit_marker_does_not_cancel_budget():
+def test_v2_partial_implicit_marker_gets_bounded_grace():
     out, cache = _implicit_budget_step(
         [START, 10, 94],
         [94],
         implicit_sequences=[(94, 95)],
     )
-    assert out[0, END_A] == 1.0e9
+    assert torch.count_nonzero(out) == 0
     assert cache[1].item() == -1
 
 
@@ -534,3 +534,179 @@ def test_v2_mixed_single_and_multi_token_implicit_markers():
             implicit_sequences=[(94,), (95, 96)],
         )
         assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("prefix", [(94,), (94, 95)])
+def test_v2_budget_exhaustion_allows_implicit_marker_to_finish(prefix):
+    out, _ = _implicit_budget_step(
+        [START, 10, *prefix], [prefix[-1]], implicit_sequences=[(94, 95, 96)]
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+def test_v2_prefix_grace_is_not_renewed_by_repeated_prefixes():
+    for count in range(1, 7):
+        out, _ = _implicit_budget_step(
+            [START, 10, *([94] * count)],
+            [94],
+            implicit_sequences=[(94, 94, 95)],
+        )
+        if count <= 2:
+            assert torch.count_nonzero(out) == 0
+        else:
+            assert out[0, END_A] == 1.0e9
+
+
+def test_v2_prefix_guard_does_not_start_after_budget_exhaustion():
+    out, _ = _implicit_budget_step(
+        [START, 10, 11, 94],
+        [94],
+        implicit_sequences=[(94, 95, 96)],
+    )
+    assert out[0, END_A] == 1.0e9
+
+
+def test_v2_diverged_prefix_forces_end_without_using_remaining_grace():
+    out, _ = _implicit_budget_step(
+        [START, 10, 94, 12],
+        [12],
+        implicit_sequences=[(94, 95, 96)],
+    )
+    assert out[0, END_A] == 1.0e9
+
+
+def test_v2_prefix_guard_in_speculative_block_is_bounded_per_row():
+    out, cache = _implicit_budget_step(
+        [START, 10],
+        [10, 94, 94, 94, 94],
+        implicit_sequences=[(94, 94, 95)],
+    )
+    expected = torch.zeros_like(out)
+    expected[3:, END_A] = 1.0e9
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert cache[1].item() == -1
+
+
+def test_v2_rejected_prefix_does_not_consume_committed_grace():
+    _, cache = _implicit_budget_step(
+        [START, 10],
+        [10, 94, 94, 94],
+        implicit_sequences=[(94, 94, 95)],
+    )
+    out, _ = _implicit_budget_step(
+        [START, 10, 94],
+        [94],
+        cache=cache,
+        implicit_sequences=[(94, 94, 95)],
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("natural_end", [(END_A,), (END_A, END_B)])
+def test_v2_started_force_finishes_after_natural_end_inside_sequence(natural_end):
+    out, _ = _implicit_budget_step(
+        [START, 10, 11],
+        [11, END_A, END_B, 96, 12],
+        natural_end=natural_end,
+        forced_end=(END_A, END_B, 96),
+    )
+    expected = torch.zeros_like(out)
+    expected[0, END_A] = 1.0e9
+    expected[1, END_B] = 1.0e9
+    expected[2, 96] = 1.0e9
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("prefix", [(94,), (94, 95)])
+def test_v2_started_force_has_priority_over_implicit_prefix_and_end(prefix):
+    out, _ = _implicit_budget_step(
+        [START, 10, 11, *prefix],
+        [prefix[-1]],
+        forced_end=(94, 95, 96),
+        implicit_sequences=[(94, 95)],
+    )
+    assert out[0, (94, 95, 96)[len(prefix)]] == 1.0e9
+
+
+def test_v2_force_prefix_in_tool_arguments_does_not_restart_thinking():
+    out, _ = _implicit_budget_step(
+        [START, 94, 95, 10, 11, END_A],
+        [END_A],
+        natural_end=(END_A,),
+        implicit_sequences=[(94, 95)],
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+def test_v2_force_continues_across_embedded_start_marker():
+    out, _ = _implicit_budget_step(
+        [START, 10, 11, END_A, START],
+        [START],
+        forced_end=(END_A, START, END_B),
+    )
+    assert out[0, END_B] == 1.0e9
+
+
+def test_v2_completed_force_stays_ended_across_decode_steps():
+    _, cache = _implicit_budget_step(
+        [START, 10, 11, END_A],
+        [END_A],
+        forced_end=(END_A, START, END_B),
+    )
+    out, cache = _implicit_budget_step(
+        [START, 10, 11, END_A, START, END_B, 12],
+        [12],
+        cache=cache,
+        forced_end=(END_A, START, END_B),
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+def test_v2_rejected_force_prefix_does_not_lock_later_tool_call():
+    _, cache = _implicit_budget_step(
+        [START, 10],
+        [10, END_A],
+    )
+    out, _ = _implicit_budget_step(
+        [START, 10, TOOL_START, 12],
+        [12],
+        cache=cache,
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("forced_end", [(94, 94), (94, 95, 94), (94, 95, 94, 95)])
+@pytest.mark.parametrize("tail_len", [0, 1, 2])
+def test_v2_self_overlapping_force_does_not_restart_after_completion(
+    forced_end, tail_len
+):
+    tail = forced_end[:tail_len]
+    tokens = [START, 10, 11, *forced_end, *tail]
+    out, _ = _implicit_budget_step(
+        tokens,
+        [tokens[-1]],
+        forced_end=forced_end,
+        implicit_sequences=[(99, 100)],
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+def test_v2_force_protection_disabled_preserves_legacy_behavior():
+    out, _ = _implicit_budget_step(
+        [START, 10, 11, END_A],
+        [END_A],
+        forced_end=(END_A, END_B, 96),
+        natural_end=(END_A,),
+        implicit_ids=(),
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("tail_len", [1022, 2046])
+def test_v2_completed_force_crossing_cold_scan_block_stays_ended(tail_len):
+    out, _ = _implicit_budget_step(
+        [START, 10, 11, END_A, START, END_B, *([12] * tail_len)],
+        [12],
+        forced_end=(END_A, START, END_B),
+    )
+    assert torch.count_nonzero(out) == 0

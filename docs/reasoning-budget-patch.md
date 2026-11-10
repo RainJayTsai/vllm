@@ -15,6 +15,7 @@ draft prefix；只有已提交的 tokens 更新持久 cache。
 
 這是原計畫中 implicit end 與 budget 一致性的第一份 patch，並包含不可分割的
 verification-prefix 修正，並已新增手動設定與多 token implicit markers。
+目前另完成 bounded prefix guard 與 forced-end continuation 修補。
 它不宣稱完成 EOS guard、累計 re-entry policy、所有 speculative backend 或實機驗證。
 既有多 token explicit end 保持支援；沒有新增英文 transition phrase、
 固定 token ID、parser 或 JSON 修復邏輯。
@@ -25,14 +26,25 @@ verification-prefix 修正，並已新增手動設定與多 token implicit marke
 | --- | --- |
 | `vllm/config/reasoning.py` | 新增預設 false 的 `enable_implicit_reasoning_end` 與預設空陣列的 `implicit_reasoning_end_strs`；將手動字串經模型 tokenizer 編碼後，與 parser metadata 合併、去重 |
 | `vllm/v1/worker/gpu/sample/thinking_budget.py` | 在 committed cold/incremental scan 與每個 verification prefix 掃描 implicit IDs；先判斷 boundary，再考慮 budget forcing |
-| `tests/v1/worker/test_gpu_thinking_budget.py` | 21 個參數化 kernel regression cases，含 rejected draft、bonus row、batch reorder、disabled budget，以及多 token implicit marker 跨 decode step／committed-draft 邊界 |
-| `tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py` | 新增 4 組真實 completions continuation 測試（stream on/off、temperature 0/0.7、seed 42），以及手動 marker 無 parser、合併去重、停用、空字串拒絕等 config 測試 |
+| `tests/v1/worker/test_gpu_thinking_budget.py` | 48 個 kernel regression cases，含 prefix grace／固定截止、rejected draft、bonus row、batch reorder、multi-token force 優先完成、自我重疊結束序列與跨 cold-scan block 的完成狀態 |
+| `tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py` | 8 組真實 completions 測試，包含 stream on/off、固定 seed、工具 marker 在額度處完成／重複 prefix 超過 grace，以及手動 marker config 測試；尚未執行 |
 | `docs/features/reasoning_outputs.md` | 記錄 flag、適用範圍與限制 |
 
-完整 natural/implicit end 若已出現在有效 prefix，該 row 不再 forcing。
+完整 natural/implicit end 若已出現在有效 prefix，且沒有已開始的 forced end
+尚待完成，該 row 不再 forcing。
 尚未被 target 接受的當前候選 token 不會提前提交 boundary。
 Parser metadata 可供應單 token IDs；手動字串也可編碼為多 token sequences。
-只有完整 marker 停止預算，未完成的 prefix 不會暫停 enforcement，以免繞過額度。
+只有完整 marker 停止預算。對長度 L 的 implicit marker，若其 prefix 在額度
+耗盡前已開始，最多容許 L-1 個額外 token 完成；截止位置固定於原本 budget end，
+不能由重複 prefix 重設。Prefix 不再匹配就立即恢復 forcing。max_tokens 仍有效。
+
+Forced-end prefix 若在 reasoning 額度耗盡時或之後開始，先完成它，再處理
+其中的 natural／implicit end 或 start markers。只在 matching forced tail
+出現時，往前找開始 forcing 前最近的完整 boundary，以免工具參數中的相同
+字串誤觸發 forcing。完整 forced end 會結束 enforcement；自我重疊的 suffix
+不得重新啟動。這可能增加長 forced-end／marker 配置的掃描成本，尚未量測效能。
+持久 cache 仍只掃 accepted history；draft prefix 的 grace 與 force progress
+均為 row-local 推算，沒有新增獨立的 request state manager。
 
 ## 套用與啟用
 
@@ -44,8 +56,8 @@ git apply --check /path/to/qwen-implicit-budget-v2.patch
 git apply /path/to/qwen-implicit-budget-v2.patch
 ```
 
-若已套用前一版交付的 patch，改用增量檔
-`qwen-implicit-budget-manual-settings.patch`，先 `git apply --check` 再套用。
+若已使用遠端 commit `60010f7` 的版本，改用本次增量檔
+`qwen-budget-prefix-guard.patch`，先 `git apply --check` 再套用。
 完整 patch 與增量 patch 二擇一，不要重複套用。
 
 若你的 baseline 不同，先核對 source audit，不能假設可直接套用。
@@ -77,26 +89,27 @@ runner 僅透過 AST 載入現有函式，避開 vLLM CUDA extension 與重量�
 runner 與完整輸出隨 artifacts 一起交付。
 
 ```bash
-TRITON_INTERPRET=1 BUDGET_BASE_REVISION=bbaef29734611db410c9ef6318757767cc68c554 \
+TRITON_INTERPRET=1 BUDGET_SOURCE_PATH=/path/to/artifacts/pre-prefix-thinking-budget.py \
   .venv/bin/python -m pytest --confcutdir=/path/to/artifacts \
   /path/to/artifacts/test_budget_interpreter.py -q
-# 15 failed, 6 passed
+# 22 failed, 26 passed (previous patch / 60010f7 kernel)
 
 TRITON_INTERPRET=1 .venv/bin/python -m pytest \
   --confcutdir=/path/to/artifacts /path/to/artifacts/test_budget_interpreter.py -q
-# 21 passed
+# 48 passed
 
 TRITON_CACHE_DIR=/tmp/triton-cache \
   .venv/bin/python /path/to/artifacts/compile_budget_sm120.py
-# 24 combinations compiled to SM120 cubin
+# 96 combinations compiled to SM120 cubin
 ```
 
 若 checkout 不在 `/workspace/vllm`，設定 `VLLM_SOURCE_ROOT` 指向它。
-Baseline runner 只移除舊 API 不接受的新增 metadata 參數，其 kernel 原封不動。
-失敗來自錯誤的 logit forcing／boundary cache，而非缺少參數的 TypeError。
+Before-fix runner 使用前一版 production kernel 的原始快照，介面相同，
+不替換 kernel body。失敗來自錯誤的 logit forcing／boundary cache。
 
 SM120 離線編譯覆蓋兩個 kernels × implicit marker 長度組合
-`()`、`(1,)`、`(1,1)`、`(2,)`、`(1,3)`、`(3,2)` × natural end 長度 1/2；
+`()`、`(1,)`、`(1,1)`、`(2,)`、`(1,3)`、`(3,2)` × natural end 長度 1/2
+× forced end 長度 1/2/3/4；
 這不是 RTX PRO 6000 上的執行或 CUDA Graph 證據。
 
 Ruff check、format 與 `git diff --check` 通過。
@@ -169,7 +182,8 @@ the remainder of the same verification block. Coordinate with that PR before
 submission; this local patch does not open a competing PR.
 
 Validation: production-kernel CPU interpreter regressions fail on the base
-(15 failed, 6 passed) and pass with this patch (21 passed); 24 SM120 offline
+(22 failed, 26 passed on the previous patch) and pass with this patch (48 passed);
+96 SM120 offline
 kernel configurations compile. Ruff and whitespace checks pass. GPU execution,
 real server regressions and model evaluations remain pending; no serving or
 performance improvement is claimed from these checks alone.

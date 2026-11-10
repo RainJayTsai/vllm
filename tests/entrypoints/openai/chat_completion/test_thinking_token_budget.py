@@ -86,7 +86,7 @@ def server_with_auto_reasoning_config():
         json.dumps(
             {
                 "enable_implicit_reasoning_end": True,
-                "implicit_reasoning_end_strs": ["<tool_call>"],
+                "implicit_reasoning_end_strs": ["<tool_call>", "a<tool_call>"],
             }
         ),
         "--max-model-len",
@@ -191,6 +191,44 @@ def test_empty_manual_implicit_marker_is_rejected():
     )
     with pytest.raises(ValueError, match="cannot contain empty strings"):
         config.initialize_token_ids(ModelConfig(model=MODEL_NAME))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("complete_marker", [False, True])
+async def test_budget_exhaustion_during_tool_marker_has_bounded_grace(
+    server_with_auto_reasoning_config, stream, complete_marker
+):
+    """Allow a tool marker to finish, but repeated prefixes cannot renew grace."""
+    tokenizer = get_tokenizer(MODEL_NAME)
+    a_ids = tokenizer.encode("a", add_special_tokens=False)
+    tool_ids = tokenizer.encode("<tool_call>", add_special_tokens=False)
+    assert len(a_ids) == len(tool_ids) == 1
+    assert (
+        tokenizer.encode("a<tool_call>", add_special_tokens=False) == a_ids + tool_ids
+    )
+    prompt = tokenizer.encode("<think>a", add_special_tokens=False)
+    next_id = tool_ids[0] if complete_marker else a_ids[0]
+    async with server_with_auto_reasoning_config.get_async_client() as client:
+        result = await client.completions.create(
+            model=MODEL_NAME,
+            prompt=prompt,
+            temperature=0,
+            seed=42,
+            max_tokens=1 if complete_marker else 2,
+            stream=stream,
+            logit_bias={str(next_id): 100},
+            extra_body={
+                "thinking_token_budget": 1,
+                "ignore_eos": True,
+                "skip_special_tokens": False,
+            },
+        )
+        if stream:
+            text = "".join([chunk.choices[0].text async for chunk in result])
+        else:
+            text = result.choices[0].text
+    assert text == ("<tool_call>" if complete_marker else "a</think>")
 
 
 @pytest.fixture(scope="module")
