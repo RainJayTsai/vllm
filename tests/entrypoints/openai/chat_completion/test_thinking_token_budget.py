@@ -85,8 +85,7 @@ def server_with_auto_reasoning_config():
         "--reasoning-config",
         json.dumps(
             {
-                "enable_implicit_reasoning_end": True,
-                "implicit_reasoning_end_strs": ["<tool_call>"],
+                "thinking_budget_policy": "qwen",
             }
         ),
         "--max-model-len",
@@ -134,6 +133,51 @@ async def test_implicit_end_budget_preserves_tool_argument_continuation(
         else:
             text = result.choices[0].text
     assert text == "a" * 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_qwen_budget_preserves_completed_tool_json(
+    server_with_auto_reasoning_config, stream
+):
+    """Regression: forcing an end phrase would corrupt the closing tool JSON."""
+    tokenizer = get_tokenizer(MODEL_NAME)
+    closing_ids = tokenizer.encode("}}", add_special_tokens=False)
+    assert len(closing_ids) == 1
+    body = '{"name":"execute_sql","arguments":{"sql":"SELECT 1"'
+    prompt = tokenizer.encode(
+        "<think>I should call execute_sql.<tool_call>" + body,
+        add_special_tokens=False,
+    )
+    async with server_with_auto_reasoning_config.get_async_client() as client:
+        result = await client.completions.create(
+            model=MODEL_NAME,
+            prompt=prompt,
+            max_tokens=1,
+            temperature=0,
+            seed=42,
+            stream=stream,
+            logit_bias={str(closing_ids[0]): 100},
+            extra_body={"thinking_token_budget": 1, "ignore_eos": True},
+        )
+        if stream:
+            text = "".join([chunk.choices[0].text async for chunk in result])
+        else:
+            text = result.choices[0].text
+    assert json.loads(body + text) == {
+        "name": "execute_sql",
+        "arguments": {"sql": "SELECT 1"},
+    }
+
+
+def test_qwen_policy_initializes_tokenized_boundaries():
+    config = ReasoningConfig(reasoning_parser="qwen3", thinking_budget_policy="qwen")
+    config.initialize_token_ids(ModelConfig(model=MODEL_NAME))
+    tokenizer = get_tokenizer(MODEL_NAME)
+    assert tokenizer.encode("<tool_call>", add_special_tokens=False) in (
+        config.implicit_reasoning_end_token_sequences
+    )
+    assert config.guard_implicit_end_prefix
 
 
 @pytest.mark.parametrize("enabled", [False, True])

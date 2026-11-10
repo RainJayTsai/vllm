@@ -5,6 +5,7 @@ from dataclasses import field
 
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
+from vllm.plugins.thinking_budget_policies import BoundaryRules, get_policy
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -25,6 +26,10 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    thinking_budget_policy: str = "default"
+    """Boundary policy compiled at initialization: default, qwen, or a plugin."""
+    _guard_implicit_end_prefix: bool = field(default=False, init=False, repr=False)
+    """Compiled policy option for bounded implicit-marker prefix matching."""
     enable_implicit_reasoning_end: bool = False
     """Honor implicit reasoning-end markers in Model Runner V2
     thinking budgets. Disabled by default to preserve existing behavior."""
@@ -36,6 +41,7 @@ class ReasoningConfig:
     _implicit_reasoning_end_token_sequences: list[list[int]] = field(
         default_factory=list, init=False, repr=False
     )
+    """Tokenized implicit boundaries compiled from parser and policy metadata."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
@@ -91,6 +97,10 @@ class ReasoningConfig:
         """Complete implicit-end sequences, including multi-token markers."""
         return self._implicit_reasoning_end_token_sequences
 
+    @property
+    def guard_implicit_end_prefix(self) -> bool:
+        return self._guard_implicit_end_prefix
+
     def initialize_token_ids(self, model_config: ModelConfig) -> None:
         """Initialize reasoning token IDs from strings using the tokenizer."""
         if (
@@ -102,6 +112,16 @@ class ReasoningConfig:
             return  # Already initialized
 
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
+        rules = get_policy(self.thinking_budget_policy).boundaries(tokenizer)
+        if not isinstance(rules, BoundaryRules):
+            raise TypeError(
+                "Thinking budget policy boundaries() must return BoundaryRules"
+            )
+        self._guard_implicit_end_prefix = rules.guard_prefix
+        implicit_enabled = (
+            self.enable_implicit_reasoning_end
+            or self.thinking_budget_policy != "default"
+        )
         reasoning_start_str = self.reasoning_start_str
         reasoning_end_str = self.reasoning_end_str
         natural_reasoning_end_str = ""
@@ -111,7 +131,7 @@ class ReasoningConfig:
                 self.reasoning_parser
             )
             reasoning_parser = parser_cls(tokenizer)
-            if self.enable_implicit_reasoning_end:
+            if implicit_enabled:
                 implicit_sequences.update(
                     (token_id,)
                     for token_id in reasoning_parser.implicit_reasoning_end_token_ids
@@ -125,8 +145,8 @@ class ReasoningConfig:
                 reasoning_end_str = end_token
             natural_reasoning_end_str = end_token or ""
 
-        if self.enable_implicit_reasoning_end:
-            for marker in self.implicit_reasoning_end_strs:
+        if implicit_enabled:
+            for marker in (*self.implicit_reasoning_end_strs, *rules.implicit_end_strs):
                 if not marker:
                     raise ValueError(
                         "implicit_reasoning_end_strs cannot contain empty strings"

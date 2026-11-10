@@ -1,5 +1,10 @@
 # Qwen implicit reasoning end：最新版 V2 patch
 
+> 此文件記錄原始分支 `60010f7dd` 的修補與當時驗證。
+> 後續 policy registry、Qwen policy 與 bounded prefix guard 請見
+> [Thinking Budget Policy](reasoning-budget-policy.md)。下文「未完成 prefix
+> 不暫停 enforcement」僅適用 default policy 的既有選項。
+
 ## 基底與範圍
 
 - Upstream：`https://github.com/vllm-project/vllm`

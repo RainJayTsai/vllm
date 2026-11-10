@@ -59,6 +59,15 @@ class CPUThinkingBudgetState:
         self.req_states = req_states
         self.max_num_reqs = req_states.max_num_reqs
         self.device = req_states.device
+        if reasoning_config is not None and (
+            reasoning_config.thinking_budget_policy != "default"
+            or reasoning_config.enable_implicit_reasoning_end
+        ):
+            raise ValueError(
+                "Thinking budget boundary policies and implicit ends currently "
+                "require the Model Runner V2 GPU sampler; the CPU sampler "
+                "supports only the default native thinking budget."
+            )
         start_ids = (
             []
             if reasoning_config is None

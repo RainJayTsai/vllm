@@ -17,6 +17,7 @@ if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
     )
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.input_batch import post_update
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.thinking_budget import (
@@ -328,6 +329,7 @@ def _implicit_budget_step(
     natural_end=(END,),
     forced_end=(END_A, END_B),
     implicit_sequences=None,
+    guard_prefix=False,
 ):
     """Run real verification rows against committed history and a draft prefix."""
     if cache is None:
@@ -352,14 +354,105 @@ def _implicit_budget_step(
         ids([len(tokens)]),
         ids(input_ids),
         ids(list(range(len(input_ids)))),
-        *cache,
+        cache[0],
+        cache[1],
+        cache[2],
         ids([START]),
         ids(natural_end),
         ids(forced_end),
         ids([token_id for sequence in implicit_sequences for token_id in sequence]),
         tuple(map(len, implicit_sequences)),
+        guard_implicit_end_prefix=guard_prefix,
     )
     return logits.cpu(), cache
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_v2_budget_crossing_inside_tool_marker_preserves_continuation(draft):
+    """Do not inject the forced end between tokens of a tool opener."""
+    tokens = [START, 10] if draft else [START, 10, 94]
+    inputs = [10, 94, 95, 96, 11] if draft else [94, 95, 96, 11]
+    out, cache = _implicit_budget_step(
+        tokens, inputs, implicit_sequences=[(94, 95, 96)], guard_prefix=True
+    )
+    assert torch.count_nonzero(out) == 0
+    assert cache[1].item() == -1
+
+
+@pytest.mark.parametrize("tail", [[94, 10], [94, 94], [10, 94]])
+def test_v2_tool_prefix_guard_cannot_restart_after_budget(tail):
+    out, _ = _implicit_budget_step(
+        [START, 10, *tail],
+        [tail[-1]],
+        implicit_sequences=[(94, 95, 96)],
+        guard_prefix=True,
+    )
+    assert out[0, END_A] == 1.0e9
+
+
+@pytest.mark.parametrize(
+    "accepted,ended",
+    [([94, 95, 96, 11], True), ([94, 10], False), ([12], False), ([94, 95, 10], False)],
+)
+def test_v2_boundary_cache_follows_speculative_token_commit(accepted, ended):
+    """Use the runner's actual commit function, including a bonus token."""
+    _, cache = _implicit_budget_step(
+        [START, 10],
+        [10, 94, 95, 96],
+        implicit_sequences=[(94, 95, 96)],
+        guard_prefix=True,
+    )
+
+    def ids(values):
+        return torch.tensor(values, dtype=torch.int32, device=DEVICE)
+
+    history = ids([[START, 10, 0, 0, 0, 0, 0, 0]])
+    total_len = ids([2])
+    post_update(
+        ids([0]),
+        ids([2]),
+        ids([10]),
+        None,
+        ids([accepted + [-1] * (4 - len(accepted))]),
+        ids([len(accepted)]),
+        ids([4 - len(accepted)]),
+        ids([0, 4]),
+        history,
+        total_len,
+    )
+    committed = history[0, : total_len.item()].tolist()
+    assert committed == [START, 10, *accepted]
+    out, cache = _implicit_budget_step(
+        committed,
+        [accepted[-1]],
+        cache=cache,
+        implicit_sequences=[(94, 95, 96)],
+        guard_prefix=True,
+    )
+    assert (cache[1].item() >= 0) == ended
+    assert (out[0, END_A].item() != 1.0e9) == ended
+
+
+def test_v2_guard_does_not_interrupt_a_forced_sequence():
+    out, _ = _implicit_budget_step(
+        [START, 10, END_A],
+        [END_A],
+        implicit_sequences=[(END_A, 95, 96)],
+        guard_prefix=True,
+    )
+    assert out[0, END_B] == 1.0e9
+
+
+def test_v2_new_reasoning_segment_after_tool_call_gets_native_budget():
+    out, cache = _implicit_budget_step(
+        [START, 94, 95, 96, 11, START, 10, 11],
+        [11],
+        implicit_sequences=[(94, 95, 96)],
+        guard_prefix=True,
+    )
+    assert cache[0].item() == 5
+    assert cache[1].item() == 1
+    assert out[0, END_A] == 1.0e9
 
 
 @pytest.mark.parametrize("budget", [0, 2, 3])
@@ -534,3 +627,40 @@ def test_v2_mixed_single_and_multi_token_implicit_markers():
             implicit_sequences=[(94,), (95, 96)],
         )
         assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("intermediate_budget", [None, 2])
+def test_v2_cancelled_request_slot_reuse_resets_boundary_cache(intermediate_budget):
+    """A completed tool boundary cannot leak into a new request in its slot."""
+    from vllm.config import ModelConfig, ReasoningConfig
+    from vllm.tokenizers import get_tokenizer
+
+    model = "Qwen/Qwen3-0.6B"
+    config = ReasoningConfig(reasoning_parser="qwen3", thinking_budget_policy="qwen")
+    config.initialize_token_ids(ModelConfig(model=model))
+    end_ids = config.reasoning_end_token_ids
+    assert end_ids
+    tokenizer = get_tokenizer(model)
+    tool_tokens = tokenizer.encode("<think>x<tool_call>{", add_special_tokens=False)
+    thinking_tokens = tokenizer.encode("<think> a b c", add_special_tokens=False)
+    req_states = _make_req_states(tool_tokens)
+    state = ThinkingBudgetState(req_states, config)
+    state.add_request(3, SamplingParams(thinking_token_budget=2))
+    state.apply_staged_writes()
+    logits = torch.zeros((1, len(tokenizer)), device=DEVICE)
+    assert torch.count_nonzero(_apply(state, logits, [tool_tokens[-1]], [0])) == 0
+
+    previous_id = "req"
+    for req_id, budget in [("replacement", intermediate_budget), ("new", 2)]:
+        assert req_states.remove_request(previous_id) == 3
+        req_states.add_request(req_id, 1, thinking_tokens, len(thinking_tokens), 32)
+        req_states.apply_staged_writes()
+        state.add_request(3, SamplingParams(thinking_token_budget=budget))
+        state.apply_staged_writes()
+        logits = torch.zeros((1, len(tokenizer)), device=DEVICE)
+        out = _apply(state, logits, [thinking_tokens[-1]], [0])
+        if budget is None:
+            assert torch.count_nonzero(out) == 0
+        else:
+            assert out[0, end_ids[0]] == 1.0e9
+        previous_id = req_id

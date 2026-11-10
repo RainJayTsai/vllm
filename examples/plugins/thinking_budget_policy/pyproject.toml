@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "example-thinking-budget-policy"
+version = "0.0.1"
+
+[project.entry-points."vllm.thinking_budget_policies"]
+example = "example_budget:ExamplePolicy"
+
+[tool.setuptools]
+py-modules = ["example_budget"]

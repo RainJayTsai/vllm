@@ -68,6 +68,7 @@ steps:
   automatic_shard: true
   timeout_in_minutes: 45
   source_file_dependencies: &v1-core-kv-metrics-deps
+    - vllm/plugins/thinking_budget_policies/
     - vllm/config/
     - vllm/distributed/
     - "!vllm/distributed/kv_transfer/"

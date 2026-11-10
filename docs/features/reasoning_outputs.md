@@ -281,12 +281,36 @@ If `thinking_token_budget` is not specified, no explicit reasoning limit is appl
 `--reasoning-config` accepts a JSON object corresponding to  
 [ReasoningConfig][vllm.config.ReasoningConfig] with the following fields:
 
-| Field                 | Type           | Description                                      |
-|-----------------------|----------------|--------------------------------------------------|
-| `reasoning_start_str` | `str \| null`  | String that marks the start of reasoning content |
-| `reasoning_end_str`   | `str \| null`  | String that marks the end of reasoning content   |
-| `enable_implicit_reasoning_end` | `bool` | Opt in to implicit ends for Model Runner V2 thinking budgets; defaults to `false` |
-| `implicit_reasoning_end_strs` | `list[str]` | Additional implicit-end markers, merged with parser metadata and tokenized with the model tokenizer; defaults to `[]` |
+| Field                           | Type          | Description                                                                                                           |
+| ------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `reasoning_start_str`           | `str \| null` | String that marks the start of reasoning content                                                                      |
+| `reasoning_end_str`             | `str \| null` | String that marks the end of reasoning content                                                                        |
+| `enable_implicit_reasoning_end` | `bool`        | Opt in to implicit ends for Model Runner V2 thinking budgets; defaults to `false`                                     |
+| `implicit_reasoning_end_strs`   | `list[str]`   | Additional implicit-end markers, merged with parser metadata and tokenized with the model tokenizer; defaults to `[]` |
+| `thinking_budget_policy`        | `str`         | Boundary policy: `default` (native behavior), `qwen`, or an installed policy plugin                                   |
+
+For Qwen templates containing `<tool_call>`, select the Qwen policy:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --reasoning-parser qwen3 \
+  --reasoning-config '{"thinking_budget_policy":"qwen"}'
+```
+
+This enables implicit ends and a bounded guard for multi-token tool openers.
+The marker is encoded by the model tokenizer; it need not be a single token.
+If a marker starts before budget exhaustion, its incomplete prefix may defer
+forcing by at most the longest marker length minus one tokens. A mismatching
+token resumes forcing on the next sampling step. New prefixes starting after
+exhaustion cannot extend the guard. An existing forced-end prefix takes priority.
+The policy rejects templates without `<tool_call>`; use explicit manual markers
+with the default policy for other formats.
+
+External policies use the `vllm.thinking_budget_policies` entry-point group and
+the existing `VLLM_PLUGINS` filter. See the
+[policy architecture and plugin example](../reasoning-budget-policy.md).
+Policies currently target the V2 GPU sampler. The CPU sampler rejects these
+options explicitly. DFlash2 uses the shared verification and commit path;
+GPU end-to-end DFlash2 validation is still required.
 
 For Qwen models that enter a tool call without emitting `</think>`, enable
 `--reasoning-config '{"enable_implicit_reasoning_end": true}'` together with
@@ -306,7 +330,9 @@ are removed after merging with parser metadata. Single-token and multi-token
 markers are supported, including sequences crossing decode steps or the
 committed/draft boundary. Only a complete marker ends reasoning; an incomplete
 prefix does not suspend budget enforcement. An empty marker is invalid.
-When the flag is false, both manual markers and parser implicit ends are ignored.
+With the default policy and the flag false, both manual markers and parser
+implicit ends are ignored. The Qwen policy enables implicit ends independently
+of the legacy flag and adds its bounded prefix guard.
 
 This option changes budget tracking; the serving parser must still understand
 the model's output format. It does not change EOS or thinking re-entry policies,

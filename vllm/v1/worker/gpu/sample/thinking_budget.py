@@ -82,6 +82,9 @@ class ThinkingBudgetState:
             reasoning_config, "implicit_reasoning_end_token_sequences", []
         )
         self.implicit_reasoning_end_lengths = tuple(map(len, implicit_sequences))
+        self.guard_implicit_end_prefix = getattr(
+            reasoning_config, "guard_implicit_end_prefix", False
+        )
         self.implicit_reasoning_end_token_ids = torch.tensor(
             [token_id for sequence in implicit_sequences for token_id in sequence],
             dtype=torch.int32,
@@ -141,6 +144,7 @@ class ThinkingBudgetState:
             self.reasoning_end_token_ids,
             self.implicit_reasoning_end_token_ids,
             self.implicit_reasoning_end_lengths,
+            self.guard_implicit_end_prefix,
         )
 
 
@@ -324,6 +328,7 @@ def _thinking_budget_kernel(
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
     IMPLICIT_END_LENS: tl.constexpr,
+    GUARD_IMPLICIT_PREFIX: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -442,6 +447,38 @@ def _thinking_budget_kernel(
             if prefix_match:
                 end_prefix_len = prefix_len
 
+    # Only a boundary that started before exhaustion gets grace. Its fixed
+    # absolute deadline cannot be extended by emitting another prefix. Complete
+    # forced-end prefixes take priority so forcing cannot be interrupted.
+    if GUARD_IMPLICIT_PREFIX and end_prefix_len == 0:
+        boundary_deadline = reasoning_start + budget
+        implicit_offset = 0
+        guarded = False
+        for marker in tl.static_range(len(IMPLICIT_END_LENS)):
+            for prefix_len in tl.static_range(1, IMPLICIT_END_LENS[marker]):
+                suffix_start = effective_len - prefix_len
+                prefix_match = (suffix_start >= reasoning_start) & (
+                    suffix_start < boundary_deadline
+                )
+                for j in tl.static_range(prefix_len):
+                    expected = tl.load(
+                        implicit_reasoning_end_token_ids_ptr + implicit_offset + j
+                    )
+                    actual = _load_effective_token(
+                        all_token_ids_ptr,
+                        all_token_ids_stride,
+                        input_ids_ptr,
+                        cur_req_first_pos,
+                        req_state_idx,
+                        total_len,
+                        tl.maximum(0, suffix_start + j),
+                    )
+                    prefix_match = prefix_match & (actual == expected)
+                guarded = guarded | prefix_match
+            implicit_offset += IMPLICIT_END_LENS[marker]
+        if guarded:
+            return
+
     force_token_id = tl.load(reasoning_end_token_ids_ptr + end_prefix_len)
     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
 
@@ -463,6 +500,7 @@ def apply_thinking_budget(
     reasoning_end_token_ids: torch.Tensor,
     implicit_reasoning_end_token_ids: torch.Tensor | None = None,
     implicit_reasoning_end_lengths: tuple[int, ...] | None = None,
+    guard_implicit_end_prefix: bool = False,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -516,4 +554,5 @@ def apply_thinking_budget(
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
         IMPLICIT_END_LENS=implicit_reasoning_end_lengths,
+        GUARD_IMPLICIT_PREFIX=guard_implicit_end_prefix,
     )
