@@ -89,14 +89,54 @@ _MAX_MARKER_LEN = max(len(m) for m in _STRUCTURAL_MARKERS)
 # "<|start|>assistant", so the model's first emitted text is " to=self<|message|>").
 _OPEN_TAIL_TO_RE = re.compile(r"[^\S\n]+to=[A-Za-z0-9_.\-]*$")
 
-# --- Tool-call extraction (unchanged from MUSE_GLIMMER_RESPONSE_SCHEMA) -------------
+# --- Tool-call extraction --------------------------------------------------
 _INVOKE_RE = re.compile(r"(<atem:invoke\b.*?</atem:invoke>)", re.DOTALL)
 _NAME_RE = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"')
-_PARAM_RE = re.compile(
-    r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>(?P<value>.*?)</atem:parameter>',
+_PARAM_OPEN_RE = re.compile(
+    r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>',
     re.DOTALL,
 )
+_PARAM_TAG_RE = re.compile(r"</?atem:(?:parameter|invoke)\b[^<>]*(?:>|(?=<)|$)")
 _FUNCTION_CALLS_OPEN = "<atem:function_calls>"
+
+
+def _iter_atem_parameters(invoke: str) -> Iterator[tuple[str, str]]:
+    """Recover parameter boundaries only inside a complete invoke.
+
+    Validate all boundaries before yielding, so nested or unnamed markup
+    cannot become a partially populated (or empty) tool call.
+    """
+    if not invoke.endswith("</atem:invoke>"):
+        return
+    end = len(invoke) - len("</atem:invoke>")
+    pending: tuple[str, int] | None = None
+    parameters: list[tuple[str, str]] = []
+    recovered: set[str] = set()
+    for tag in _PARAM_TAG_RE.finditer(invoke, invoke.index(">") + 1, end):
+        if tag.group() == "</atem:parameter>":
+            if pending is None:
+                raise ValueError("Unmatched ATEM parameter close")
+            key, start = pending
+            parameters.append((key, invoke[start : tag.start()]))
+            pending = None
+            continue
+        opening = _PARAM_OPEN_RE.fullmatch(tag.group())
+        if opening is None or tag.group().endswith("/>"):
+            raise ValueError("Unnamed or nested ATEM markup")
+        if pending is not None:
+            key, start = pending
+            parameters.append((key, invoke[start : tag.start()]))
+            recovered.add("next parameter opening")
+        pending = opening.group("key"), tag.end()
+    if pending is not None:
+        key, start = pending
+        parameters.append((key, invoke[start:end]))
+        recovered.add("invoke closing")
+    for reason in sorted(recovered):
+        logger.warning_once(
+            "Muse: recovered missing </atem:parameter> at %s boundary.", reason
+        )
+    yield from parameters
 
 
 def _decode_value(raw: str):
@@ -381,9 +421,12 @@ class MuseToolParser(ToolParser):
             name = cls._normalize_name(name_m.group(1), registered)
             string_parameters = (strings or {}).get(name, set())
             args: dict = {}
-            for pm in _PARAM_RE.finditer(invoke):
-                key, raw = pm.group("key"), pm.group("value")
-                args[key] = raw if key in string_parameters else _decode_value(raw)
+            try:
+                for key, raw in _iter_atem_parameters(invoke):
+                    args[key] = raw if key in string_parameters else _decode_value(raw)
+            except ValueError:
+                logger.warning_once("Muse: skipping invoke with ambiguous ATEM markup.")
+                continue
             tool_calls.append(
                 ToolCall(
                     function=FunctionCall(

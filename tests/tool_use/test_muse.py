@@ -32,6 +32,7 @@ from typing import cast
 
 import pytest
 
+from vllm.entrypoints.generate.base.protocol import DeltaToolCall
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.reasoning.muse_reasoning_parser import MuseReasoningParser
@@ -613,6 +614,180 @@ def test_string_parameter_schema_preserves_raw_text(value, request_kind, parser_
         name, arguments = _fn_of(calls[0])
         assert name == "echo"
         assert json.loads(arguments) == expected
+
+
+# --------------------------------------------------------- parameter recovery
+
+
+@pytest.mark.parametrize("parser_class", [MuseToolParser, MuseGlimmerToolParser])
+@pytest.mark.parametrize("closed", range(8))
+def test_missing_parameter_closes_preserve_boundaries(parser_class, closed):
+    """A later parameter's close must never swallow an earlier argument."""
+    request = ChatCompletionRequest(model="test", messages=[])
+    body = "".join(
+        f'<atem:parameter name="{key}">{value}'
+        + ("</atem:parameter>" if closed & (1 << i) else "")
+        for i, (key, value) in enumerate(
+            [("city", "台北"), ("options", '{"units":"C"}'), ("days", "[1,2]")]
+        )
+    )
+    raw = (
+        'to=weather<|message|><atem:invoke name="weather">'
+        + body
+        + "</atem:invoke><|eom|>"
+    )
+    result = parser_class(object()).extract_tool_calls(raw, request)
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "city": "台北",
+        "options": {"units": "C"},
+        "days": [1, 2],
+    }
+
+
+@pytest.mark.parametrize("parser_class", [MuseToolParser, MuseGlimmerToolParser])
+@pytest.mark.parametrize(
+    "value",
+    ["", " \n 台北 café \n ", "25", '"<div>hello</div>"', '{"unfinished":'],
+)
+def test_recovered_parameter_preserves_decoding(parser_class, value):
+    """Recovery keeps exact strings and the existing failed-JSON fallback."""
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+    raw = (
+        'to=echo<|message|><atem:invoke name="echo.echo">'
+        f'<atem:parameter name="text">{value}</atem:invoke><|eom|>'
+    )
+    expected = value
+    if parser_class is MuseGlimmerToolParser:
+        with suppress(ValueError):
+            expected = json.loads(value)
+    calls = parser_class(object()).extract_tool_calls(raw, request).tool_calls
+    assert len(calls) == 1
+    assert calls[0].function.name == "echo"
+    assert json.loads(calls[0].function.arguments) == {"text": expected}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<atem:parameter>unnamed</atem:parameter>",
+        '<atem:parameter name="a">outer<atem:parameter name="b">inner'
+        "</atem:parameter></atem:parameter>",
+        '<atem:invoke name="nested"></atem:invoke>',
+        '<atem:parameter name="a">value</atem:parameter></atem:parameter>',
+        '<atem:parameter name="a"',
+        '<atem:parameter name="a" <atem:parameter name="b">value',
+        '<atem:parameter name="a"/>',
+    ],
+)
+def test_ambiguous_parameters_do_not_become_empty_calls(body):
+    request = ChatCompletionRequest(model="test", messages=[])
+    raw = f'to=echo<|message|><atem:invoke name="echo">{body}</atem:invoke>'
+    result = MuseToolParser(object()).extract_tool_calls(raw, request)
+    assert not result.tools_called
+    assert result.tool_calls == []
+
+
+@pytest.mark.parametrize("parser_class", [MuseToolParser, MuseGlimmerToolParser])
+@pytest.mark.parametrize("chunk", [1, 7, 31])
+@pytest.mark.parametrize("complete", [False, True])
+def test_recovered_calls_stream_only_after_invoke_close(parser_class, chunk, complete):
+    """Streaming preserves content and emits each complete call exactly once."""
+    request = ChatCompletionRequest(model="test", messages=[])
+    invoke = (
+        '<atem:invoke name="echo"><atem:parameter name="text">台北'
+        '<atem:parameter name="count">2</atem:parameter>'
+    )
+    # The same damaged markup in a non-tool channel must stay content.
+    raw = "to=user<|message|>" + invoke + "</atem:invoke><|eom|>"
+    raw += "<|start|>assistant to=echo<|message|>" + invoke
+    if complete:
+        raw += '</atem:invoke><atem:invoke name="ping"></atem:invoke><|eom|>'
+        raw += "<|start|>assistant to=user<|message|>完成<|eot|>"
+    parser = parser_class(object())
+    calls: list[DeltaToolCall] = []
+    content: list[str] = []
+    tool_start = raw.index("<|start|>assistant to=echo")
+    for end in range(chunk, len(raw) + chunk, chunk):
+        previous, current = raw[: end - chunk], raw[:end]
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, current[len(previous) :], [], [], [], request
+        )
+        if delta:
+            content.append(delta.content or "")
+            calls.extend(delta.tool_calls or [])
+        # A closed example in to=user is never a tool; the real invoke must close.
+        assert len(calls) == current[tool_start:].count("</atem:invoke>")
+    result = parser_class(object()).extract_tool_calls(raw, request)
+    assert "".join(content) == result.content
+    assert len(calls) == (2 if complete else 0)
+    assert [call.index for call in calls] == list(range(len(calls)))
+    assert [_fn_of(call) for call in calls] == [
+        (call.function.name, call.function.arguments) for call in result.tool_calls
+    ]
+    if complete:
+        assert json.loads(_fn_of(calls[0])[1]) == {"text": "台北", "count": 2}
+        assert json.loads(_fn_of(calls[1])[1]) == {}
+
+
+@pytest.mark.parametrize("parser_class", [MuseToolParser, MuseGlimmerToolParser])
+def test_missing_array_close_after_reasoning(parser_class):
+    """A structured array survives recovery after a separate reasoning message."""
+    selections = [
+        {"path": f"docs/example-{i}.txt", "selected": False} for i in range(5)
+    ]
+    raw = (
+        " to=self<|message|>Select the example files.<|eom|>"
+        "<|start|>assistant to=choose_files<|message|><atem:function_calls>"
+        '<atem:invoke name="choose_files"><atem:parameter name="selections">'
+        + json.dumps(selections)
+        + "</atem:invoke>\n</atem:function_calls><|eot|>"
+    )
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        tools=[{"type": "function", "function": {"name": "choose_files"}}],
+    )
+    result = parser_class(object()).extract_tool_calls(raw, request)
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "choose_files"
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "selections": selections
+    }
+    for chunk in (1, 31):
+        parser = parser_class(object())
+        calls: list[DeltaToolCall] = []
+        for end in range(chunk, len(raw) + chunk, chunk):
+            previous, current = raw[: end - chunk], raw[:end]
+            delta = parser.extract_tool_calls_streaming(
+                previous, current, current[len(previous) :], [], [], [], request
+            )
+            if delta:
+                calls.extend(delta.tool_calls or [])
+            assert len(calls) == current.count("</atem:invoke>")
+        assert len(calls) == 1
+        assert calls[0].index == 0
+        assert _fn_of(calls[0]) == (
+            "choose_files",
+            result.tool_calls[0].function.arguments,
+        )
 
 
 # --------------------------------------------------- reasoning token counting
